@@ -1,64 +1,59 @@
-// mend applies the four patch formats in SPEC.md using only the Node standard library.
-// Parsing finishes before file access, and edits are staged until every edit succeeds.
-
 import { readFileSync, writeSync } from 'node:fs';
-import { Exit2, patchLines, detect } from './lib/patch.ts';
-import type { Edit } from './lib/patch.ts';
-import { unifiedEdits } from './lib/unified.ts';
-import { searchReplaceEdits } from './lib/search_replace.ts';
-import { v4aEdits } from './lib/v4a.ts';
-import { jsonEdits } from './lib/json.ts';
-import { applyEdits } from './lib/apply.ts';
+import { execute } from './lib/apply.ts';
+import { parsePatch } from './lib/patch.ts';
+import type { Edit, Format } from './lib/patch.ts';
 
-const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
+interface CliResult {
+  code: number;
+  out: string[];
+}
 
-function parseArgs(args: string[]): { format: string | null; check: boolean; strict: boolean; file: string | null } | null {
-  let format: string | null = null;
+function run(arguments_: string[]): CliResult {
+  let format: Format | 'auto' = 'auto';
   let check = false;
   let strict = false;
-  const pos: string[] = [];
-  let ended = false;
-  for (const a of args) {
-    if (!ended && a === '--') ended = true;
-    else if (!ended && a.startsWith('-') && a !== '-') {
-      if (a.startsWith('--format=') && format === null && FORMATS.includes(a.slice(9))) format = a.slice(9);
-      else if (a === '--check' && !check) check = true;
-      else if (a === '--strict' && !strict) strict = true;
-      else return null;
-    } else pos.push(a);
+  let positional = false;
+  const seen = new Set<string>();
+  const paths: string[] = [];
+  for (const argument of arguments_) {
+    if (!positional && argument === '--') {
+      positional = true;
+    } else if (!positional && argument.startsWith('-') && argument !== '-') {
+      const option = argument.startsWith('--format=') ? '--format' : argument;
+      if (seen.has(option)) return report('usage');
+      seen.add(option);
+      if (option === '--check') check = true;
+      else if (option === '--strict') strict = true;
+      else if (option === '--format') {
+        const value = argument.slice(9);
+        if (!['auto', 'unified', 'search-replace', 'v4a', 'json'].includes(value)) {
+          return report('usage');
+        }
+        format = value as Format | 'auto';
+      } else return report('usage');
+    } else paths.push(argument);
   }
-  if (pos.length > 1) return null;
-  const file = pos.length === 0 || pos[0] === '-' ? null : pos[0]!;
-  return { format, check, strict, file };
-}
-
-function run(args: string[]): { code: number; out: string[] } {
-  const options = parseArgs(args);
-  if (options === null) return { code: 2, out: ['error: usage'] };
-  const { format, check, strict, file } = options;
-  let text = '';
+  if (paths.length > 1) return report('usage');
+  let patch: string;
   try {
-    text = readFileSync(file ?? 0, 'utf8');
+    patch = readFileSync(paths[0] === undefined || paths[0] === '-' ? 0 : paths[0], 'utf8');
   } catch {
-    if (file !== null) return { code: 2, out: ['error: no-patch'] };
+    return report('no-patch');
   }
-  const lines = patchLines(text);
-  const kind = format === null || format === 'auto' ? detect(lines) : format;
-  if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines)
-      : kind === 'unified' ? unifiedEdits(lines, strict)
-      : kind === 'search-replace' ? searchReplaceEdits(lines, strict)
-      : v4aEdits(lines, strict);
-    if (edits.length === 0) throw new Exit2('error: parse 1');
-  } catch (e) {
-    if (e instanceof Exit2) return { code: 2, out: [e.line] };
-    throw e;
+    edits = parsePatch(patch, format);
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return report(error.message);
   }
-  return applyEdits(edits, check);
+  const result = execute(edits, strict, check);
+  return { out: result.output, code: result.exit };
 }
 
+function report(message: string): CliResult {
+  return { code: 2, out: [`error: ${message}`] };
+}
 
 const trialEnv = process.env.MAKEFUN_ENV_URL;
 if (trialEnv !== undefined && trialEnv !== '') {

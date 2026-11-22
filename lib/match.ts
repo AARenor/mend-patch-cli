@@ -1,77 +1,93 @@
-import { blank } from './patch.ts';
-import type { BodyLine, LineMatch } from './patch.ts';
+export interface TextLines {
+  lines: string[];
+  break: string;
+  final: boolean;
+}
 
-function horizontalTrim(line: string, leading: boolean): string {
+export interface BodyLine {
+  kind: ' ' | '-' | '+';
+  text: string;
+  noBreak?: boolean;
+}
+
+export interface Occurrences {
+  positions: number[];
+  tier: number;
+}
+
+export function splitPatch(text: string): string[] {
+  if (text === '') return [];
+  const lines = text.split('\n');
+  if (text.endsWith('\n')) lines.pop();
+  return lines.map((line) => line.endsWith('\r') ? line.slice(0, -1) : line);
+}
+
+export function openText(text: string): TextLines {
+  const feed = text.indexOf('\n');
+  const lineBreak = feed > 0 && text[feed - 1] === '\r' ? '\r\n' : '\n';
+  const final = text.endsWith(lineBreak);
+  const lines = text === '' ? [] : text.split(lineBreak);
+  if (final) lines.pop();
+  return { lines, break: lineBreak, final };
+}
+
+export function closeText(file: TextLines): string {
+  return file.lines.length === 0 ? '' : file.lines.join(file.break) + (file.final ? file.break : '');
+}
+
+export function occurrences(
+  lines: string[], old: string[], strict: boolean, start = 0, endOnly = false,
+): Occurrences {
+  // A short or empty remaining file cannot contain this needle; skip all tiers.
+  if (old.length > lines.length - start) return { positions: [], tier: 0 };
+  for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
+    const needle = old.map((line) => matchKey(line, tier));
+    const positions: number[] = [];
+    for (let at = start; at + old.length <= lines.length; at++) {
+      if (endOnly && at + old.length !== lines.length) continue;
+      if (needle.every((line, offset) => matchKey(lines[at + offset], tier) === line)) positions.push(at);
+    }
+    if (positions.length) return { positions, tier };
+  }
+  return { positions: [], tier: 0 };
+}
+
+// Only spaces are trimmed from patch paths: a tab separates a path from a timestamp.
+export function trimSpaces(text: string): string {
   let start = 0;
+  let end = text.length;
+  while (start < end && text[start] === ' ') start++;
+  while (end > start && text[end - 1] === ' ') end--;
+  return text.slice(start, end);
+}
+
+// Keep both sides of each matching tier on the same whitespace policy. The scan is
+// index arithmetic rather than a trailing-space regex, which is quadratic on a long run.
+function matchKey(line: string, tier: number): string {
+  if (tier === 0) return line;
   let end = line.length;
   while (end > 0 && (line[end - 1] === ' ' || line[end - 1] === '\t')) end--;
-  if (leading) {
-    while (start < end && (line[start] === ' ' || line[start] === '\t')) start++;
-  }
+  if (tier === 1) return line.slice(0, end);
+  let start = 0;
+  while (start < end && (line[start] === ' ' || line[start] === '\t')) start++;
   return line.slice(start, end);
 }
 
-function matchingPositions(source: string[], wanted: string[], start: number, endOnly: boolean): number[] {
-  const last = source.length - wanted.length;
-  const positions: number[] = [];
-  for (let at = endOnly ? last : start; at <= last; at++) {
-    if (at < start) continue;
-    let matched = true;
-    for (let i = 0; i < wanted.length; i++) {
-      if (source[at + i] !== wanted[i]) {
-        matched = false;
-        break;
-      }
-    }
-    if (matched) positions.push(at);
-    if (endOnly) break;
-  }
-  return positions;
-}
-
-/**
- * Reports tier 0 (exact), 1 (trailing whitespace), or 2 (leading and trailing whitespace).
- * Tier 2 also re-indents additions through replacementLines, so readers must not.
- */
-export function matchLines(file: string[], old: string[], strict: boolean, start = 0, endOnly = false): LineMatch | null {
-  // An empty old-lines array has no match, including in an empty file.
-  if (old.length === 0) return null;
-  // No tier can fit the old lines beyond the remaining search window.
-  if (old.length > file.length || start > file.length - old.length) return null;
-  // Keep tier priority here so every format chooses exact matches before relaxed ones.
-  for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
-    const source = tier === 0 ? file : file.map((line) => horizontalTrim(line, tier === 2));
-    const wanted = tier === 0 ? old : old.map((line) => horizontalTrim(line, tier === 2));
-    const positions = matchingPositions(source, wanted, start, endOnly);
-    if (positions.length > 0) return { tier, positions };
-  }
-  return null;
-}
-
-function indentation(line: string): string {
-  let end = 0;
-  while (end < line.length && (line[end] === ' ' || line[end] === '\t')) end++;
-  return line.slice(0, end);
-}
-
-export function replacementLines(body: BodyLine[], file: string[], at: number, tier: number): string[] {
-  let patchIndent = '';
-  let fileIndent = '';
-  if (tier === 2) {
-    const oldFirst = body.find((line) => line.kind !== '+');
-    patchIndent = indentation(oldFirst?.text ?? '');
-    fileIndent = indentation(file[at] ?? '');
-  }
+export function replacement(lines: string[], at: number, body: BodyLine[], tier: number): string[] {
+  const old = body.filter((line) => line.kind !== '+');
+  const fileIndent = (lines[at] ?? '').match(/^[ \t]*/)?.[0] ?? '';
+  const patchIndent = (old[0]?.text ?? '').match(/^[ \t]*/)?.[0] ?? '';
   const result: string[] = [];
-  let cursor = at;
+  let consumed = 0;
   for (const line of body) {
-    if (line.kind === ' ') result.push(file[cursor++]!);
-    else if (line.kind === '-') cursor++;
+    if (line.kind === ' ') result.push(lines[at + consumed++]);
+    else if (line.kind === '-') consumed++;
     else {
-      const text = line.text;
-      result.push(tier === 2 && !blank(text) && text.startsWith(patchIndent)
-        ? fileIndent + text.slice(patchIndent.length)
-        : text);
+      let text = line.text;
+      if (tier === 2 && /[^ \t]/.test(text) && text.startsWith(patchIndent)) {
+        text = fileIndent + text.slice(patchIndent.length);
+      }
+      result.push(text);
     }
   }
   return result;

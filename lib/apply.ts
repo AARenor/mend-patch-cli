@@ -1,53 +1,153 @@
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Tree, Fail } from './patch.ts';
+import { closeText, occurrences, openText, replacement, splitPatch } from './match.ts';
 import type { Edit } from './patch.ts';
 
-export function applyEdits(edits: Edit[], check: boolean): { code: number; out: string[] } {
-  const tree = new Tree();
-  const fails: Fail[] = [];
+export interface Execution {
+  exit: number;
+  output: string[];
+}
+
+export function execute(edits: Edit[], strict: boolean, check: boolean): Execution {
+  const original = new Map<string, string | null>();
+  const staged = new Map<string, string | null>();
+  const moves: { from: string; to: string }[] = [];
+  const errors: string[] = [];
+  const load = (path: string): string | null => {
+    if (!staged.has(path)) {
+      const text = existsSync(path) ? readFileSync(path, 'utf8') : null;
+      original.set(path, text);
+      staged.set(path, text);
+    }
+    return staged.get(path) ?? null;
+  };
   for (const edit of edits) {
-    const before = new Map(tree.now);
-    const moveCount = tree.moves.length;
+    const paths = edit.destination === undefined ? [edit.path] : [edit.path, edit.destination];
+    const unsafe = paths.find((path) => path === '' || path.startsWith('/') || path.includes('\\')
+      || path.split('/').some((segment) => segment === '' || segment === '.' || segment === '..'));
+    if (unsafe !== undefined) {
+      errors.push(`error: unsafe ${unsafe}`);
+      continue;
+    }
+    const before = load(edit.path);
+    if (edit.kind === 'create') {
+      if (before !== null) errors.push(`error: exists ${edit.path}`);
+      else staged.set(edit.path, edit.text ?? '');
+      continue;
+    }
+    if (before === null) {
+      errors.push(`error: missing ${edit.path}`);
+      continue;
+    }
+    if (edit.destination !== undefined && load(edit.destination) !== null) {
+      errors.push(`error: exists ${edit.destination}`);
+      continue;
+    }
+    if (edit.kind === 'delete') {
+      staged.set(edit.path, null);
+      continue;
+    }
+    let after: string;
     try {
-      edit(tree);
-    } catch (e) {
-      if (!(e instanceof Fail)) throw e;
-      tree.now.clear();
-      for (const [k, v] of before) tree.now.set(k, v);
-      tree.moves.length = moveCount;
-      fails.push(e);
+      after = changeText(before, edit, strict);
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      errors.push(`error: ${error.message} ${edit.path}`);
+      continue;
+    }
+    if (edit.destination !== undefined) {
+      staged.set(edit.path, null);
+      staged.set(edit.destination, after);
+      moves.push({ from: edit.path, to: edit.destination });
+    } else staged.set(edit.path, after);
+  }
+  if (errors.length) return { exit: 1, output: [...errors, `failed: ${errors.length} of ${edits.length} edits`] };
+  const changed = new Set([...staged.keys()].filter((path) => original.get(path) !== staged.get(path)));
+  const listing: { path: string; line: string }[] = [];
+  for (const move of moves) {
+    if (original.get(move.from) != null && staged.get(move.from) === null
+      && original.get(move.to) === null && staged.get(move.to) != null
+      && changed.has(move.from) && changed.has(move.to)) {
+      listing.push({ path: move.to, line: `R ${move.from} -> ${move.to}` });
+      changed.delete(move.from);
+      changed.delete(move.to);
     }
   }
-  if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const moved = new Set<string>();
-  const changes: { path: string; row: string }[] = [];
-  for (const { oldPath, newPath } of tree.moves) {
-    if (moved.has(oldPath) || moved.has(newPath)) continue;
-    if (tree.original(oldPath) !== null && tree.get(oldPath) === null
-      && tree.original(newPath) === null && tree.get(newPath) !== null) {
-      changes.push({ path: newPath, row: `R ${oldPath} -> ${newPath}` });
-      moved.add(oldPath);
-      moved.add(newPath);
-    }
+  for (const path of changed) {
+    const kind = original.get(path) === null ? 'A' : staged.get(path) === null ? 'D' : 'M';
+    listing.push({ path, line: `${kind} ${path}` });
   }
-  for (const [p, now] of tree.now) {
-    const was = tree.original(p);
-    if (was === now) continue;
-    if (!moved.has(p)) changes.push({ path: p, row: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
-  }
+  listing.sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)));
   if (!check) {
-    // Delete blocking files first when a patch creates a path beneath a deleted file.
-    for (const [p, now] of tree.now) {
-      if (now === null && tree.original(p) !== null) rmSync(p, { force: true });
+    for (const [path, text] of staged) {
+      if (text === null && original.get(path) !== null) unlinkSync(path);
     }
-    for (const [p, now] of tree.now) {
-      if (now === null || tree.original(p) === now) continue;
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+    for (const [path, text] of staged) {
+      if (text !== null && text !== original.get(path)) {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, text, 'utf8');
+      }
     }
   }
-  changes.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  const rows = changes.map((change) => change.row);
-  return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
+  const count = listing.length;
+  return { exit: 0, output: [...listing.map((item) => item.line), `ok: ${count} ${count === 1 ? 'file' : 'files'}`] };
+}
+
+function changeText(before: string, edit: Edit, strict: boolean): string {
+  const file = openText(before);
+  if (edit.kind === 'replace') {
+    const normalize = (text: string) => file.break === '\r\n' ? text.replaceAll('\r\n', '\n') : text;
+    const text = normalize(before);
+    const old = normalize(edit.old ?? '');
+    const added = normalize(edit.text ?? '');
+    const at = text.indexOf(old);
+    if (at === -1) throw new Error('no-match');
+    if (text.indexOf(old, at + 1) !== -1) throw new Error('ambiguous');
+    const result = text.slice(0, at) + added + text.slice(at + old.length);
+    return file.break === '\r\n' ? result.replaceAll('\n', '\r\n') : result;
+  }
+  if (edit.kind === 'insert') {
+    const at = edit.insertLine ?? -1;
+    if (at < 0 || at > file.lines.length) throw new Error('no-match');
+    file.lines.splice(at, 0, ...splitPatch(edit.text ?? ''));
+    return closeText(file);
+  }
+  let cursor = 0;
+  let delta = 0;
+  for (const chunk of edit.chunks ?? []) {
+    if (chunk.anchor !== undefined) {
+      const anchor = occurrences(file.lines, [chunk.anchor], strict, cursor);
+      if (!anchor.positions.length) throw new Error('no-match');
+      cursor = anchor.positions[0] + 1;
+    }
+    const old = chunk.body.filter((line) => line.kind !== '+').map((line) => line.text);
+    let at: number;
+    let tier = 0;
+    if (old.length === 0) {
+      at = edit.kind === 'unified' ? Math.max(0, Math.min(file.lines.length, chunk.line + delta))
+        : chunk.eof ? file.lines.length : cursor;
+    } else {
+      const found = occurrences(file.lines, old, strict, edit.kind === 'v4a' ? cursor : 0, chunk.eof ?? false);
+      if (!found.positions.length) throw new Error('no-match');
+      if (edit.kind === 'search' && found.positions.length > 1) throw new Error('ambiguous');
+      at = found.positions[0];
+      tier = found.tier;
+      if (edit.kind === 'unified') {
+        const target = chunk.line - 1 + delta;
+        for (const candidate of found.positions) {
+          if (Math.abs(candidate - target) < Math.abs(at - target)) at = candidate;
+        }
+      }
+    }
+    const added = replacement(file.lines, at, chunk.body, tier);
+    const touchesEnd = at + old.length === file.lines.length;
+    if (edit.kind === 'unified' && touchesEnd) {
+      const lastOutput = chunk.body.findLast((line) => line.kind !== '-');
+      file.final = !lastOutput?.noBreak;
+    }
+    file.lines.splice(at, old.length, ...added);
+    cursor = at + added.length;
+    delta += added.length - old.length;
+  }
+  return closeText(file);
 }

@@ -1,213 +1,108 @@
-import { Exit2, Fail, safe, readLines, writeLines, createdLines } from './patch.ts';
-import type { BodyLine, Edit, Tree } from './patch.ts';
-import { matchLines, replacementLines } from './match.ts';
+import type { BodyLine } from './match.ts';
+import { trimSpaces } from './match.ts';
+import type { Chunk, Edit } from './patch.ts';
 
-type Hunk = { oldStart: number; body: BodyLine[] };
-
-function applyHunks(original: string, hunks: Hunk[], strict: boolean, path: string): string {
-  const file = readLines(original);
-  let delta = 0;
-  for (const hunk of hunks) {
-    const old: string[] = [];
-    let newCount = 0;
-    let lastNew: BodyLine | undefined;
-    for (const bodyLine of hunk.body) {
-      if (bodyLine.kind !== '+') old.push(bodyLine.text);
-      if (bodyLine.kind !== '-') {
-        newCount++;
-        lastNew = bodyLine;
-      }
-    }
-
-    let at: number;
-    let tier = 0;
-    if (old.length === 0) {
-      at = Math.max(0, Math.min(file.lines.length, hunk.oldStart + delta));
-    } else {
-      const found = matchLines(file.lines, old, strict);
-      if (found === null) throw new Fail('no-match', path);
-      tier = found.tier;
-      const target = Math.max(0, Math.min(file.lines.length, hunk.oldStart - 1 + delta));
-      at = found.positions[0];
-      for (const position of found.positions) {
-        const distance = Math.abs(position - target);
-        const bestDistance = Math.abs(at - target);
-        if (distance < bestDistance || (distance === bestDistance && position < at)) at = position;
-      }
-    }
-
-    const atEnd = at + old.length === file.lines.length;
-    const replacement = replacementLines(hunk.body, file.lines, at, tier);
-    file.lines = file.lines.slice(0, at).concat(replacement, file.lines.slice(at + old.length));
-    if (atEnd) file.final = !lastNew?.noNewline;
-    delta += newCount - old.length;
-  }
-  return writeLines(file);
+interface Section {
+  old: string;
+  next: string;
+  paired: boolean;
+  create: boolean;
+  remove: boolean;
+  chunks: Chunk[];
 }
 
-export function unifiedEdits(lines: string[], strict: boolean): Edit[] {
-  type Section = {
-    gitOld: string | undefined;
-    gitNew: string | undefined;
-    renameOld: string | undefined;
-    renameNew: string | undefined;
-    pairOld: string | null | undefined;
-    pairNew: string | null | undefined;
-    hasPair: boolean;
-    create: boolean;
-    remove: boolean;
-    header: boolean;
-    hunks: Hunk[];
-  };
-
-  const sections: Section[] = [];
+export function parseUnified(lines: string[]): Edit[] {
+  const edits: Edit[] = [];
   let section: Section | undefined;
-
-  function startSection(gitOld?: string, gitNew?: string): Section {
-    const next: Section = {
-      gitOld,
-      gitNew,
-      renameOld: undefined,
-      renameNew: undefined,
-      pairOld: undefined,
-      pairNew: undefined,
-      hasPair: false,
-      create: false,
-      remove: false,
-      header: true,
-      hunks: [],
-    };
-    sections.push(next);
-    return next;
-  }
-
-  function headerPath(line: string): string | null {
-    const rest = line.slice(4);
-    const tab = rest.indexOf('\t');
-    const part = tab < 0 ? rest : rest.slice(0, tab);
-    let start = 0;
-    let end = part.length;
-    while (start < end && part[start] === ' ') start++;
-    while (end > start && part[end - 1] === ' ') end--;
-    const path = part.slice(start, end);
-    if (path === '/dev/null') return null;
+  const finish = () => {
+    if (!section) return;
+    const { old, next, create, remove, chunks } = section;
+    if (create || old === '/dev/null') {
+      const added = chunks.flatMap((chunk) => chunk.body.filter((line) => line.kind === '+'));
+      const text = added.map((line) => line.text).join('\n')
+        + (added.length && !added[added.length - 1].noBreak ? '\n' : '');
+      edits.push({ kind: 'create', path: next, text });
+    } else if (remove || next === '/dev/null') {
+      edits.push({ kind: 'delete', path: old });
+    } else {
+      edits.push({ kind: 'unified', path: old, destination: next === old ? undefined : next, chunks });
+    }
+  };
+  const pathFromHeader = (line: string) => {
+    const path = trimSpaces(line.slice(4).split('\t', 1)[0]);
     return path.startsWith('a/') || path.startsWith('b/') ? path.slice(2) : path;
-  }
-
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (/^diff --git(?:\s|$)/.test(line)) {
-      const prefix = 'diff --git a/';
-      const delimiter = line.startsWith(prefix) ? line.indexOf(' b/', prefix.length) : -1;
-      if (delimiter < 0) throw new Exit2(`error: parse ${i + 1}`);
-      section = startSection(line.slice(prefix.length, delimiter), line.slice(delimiter + 3));
-      i++;
-      continue;
-    }
-
-    const pair = line.startsWith('--- ') && i + 1 < lines.length && lines[i + 1].startsWith('+++ ');
-    if (pair) {
-      if (section === undefined || !section.header) section = startSection();
-      section.pairOld = headerPath(line);
-      section.pairNew = headerPath(lines[i + 1]);
-      section.hasPair = true;
-      i += 2;
-      continue;
-    }
-
-    if (line.startsWith('@@')) {
-      const header = /^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@/.exec(line);
-      if (header === null || section === undefined) throw new Exit2(`error: parse ${i + 1}`);
-      section.header = false;
-      const oldStart = Number(header[1]);
-      i++;
-      const bodyStart = i;
-      while (i < lines.length) {
-        const bodyLine = lines[i];
-        if (bodyLine.startsWith('diff --git ') ||
-            (bodyLine.startsWith('--- ') && i + 1 < lines.length && lines[i + 1].startsWith('+++ '))) break;
-        if (bodyLine !== '' && bodyLine[0] !== ' ' && bodyLine[0] !== '-' &&
-            bodyLine[0] !== '+' && bodyLine[0] !== '\\') break;
-        i++;
+  };
+  const pathsFromDiff = (line: string): [string, string] => {
+    // Split at the last ' b/' so a path that itself holds ' b/' keeps its bytes.
+    const rest = line.slice(11);
+    if (!rest.startsWith('a/')) throw new Error('bad');
+    for (let at = rest.length - 3; at > 2; at--) {
+      if (rest[at] === ' ' && rest[at + 1] === 'b' && rest[at + 2] === '/') {
+        const destination = rest.slice(at + 3);
+        if (destination !== '') return [rest.slice(2, at), destination];
       }
-      let bodyEnd = i;
-      while (bodyEnd > bodyStart && lines[bodyEnd - 1] === '') bodyEnd--;
+    }
+    throw new Error('bad');
+  };
+  for (let at = 0; at < lines.length;) {
+    const line = lines[at];
+    if (line.startsWith('diff --git ')) {
+      let paths: [string, string];
+      try {
+        paths = pathsFromDiff(line);
+      } catch {
+        throw new Error(`parse ${at + 1}`);
+      }
+      finish();
+      section = { old: paths[0], next: paths[1], paired: false, create: false, remove: false, chunks: [] };
+      at++;
+    } else if (line.startsWith('--- ')) {
+      if (!lines[at + 1]?.startsWith('+++ ')) {
+        if (section && section.chunks.length === 0) throw new Error(`parse ${at + 2}`);
+        at++;
+        continue;
+      }
+      if (!section || section.paired || section.chunks.length > 0) {
+        finish();
+        section = { old: '', next: '', paired: false, create: false, remove: false, chunks: [] };
+      }
+      section.old = pathFromHeader(line);
+      section.next = pathFromHeader(lines[at + 1]);
+      section.paired = true;
+      at += 2;
+    } else if (line.startsWith('@@')) {
+      const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (!section || !header) throw new Error(`parse ${at + 1}`);
       const body: BodyLine[] = [];
-      let previous: BodyLine | undefined;
-      for (let j = bodyStart; j < bodyEnd; j++) {
-        const text = lines[j];
-        if (text.startsWith('\\')) {
-          if (previous !== undefined) previous.noNewline = true;
-          previous = undefined;
+      const raw: string[] = [];
+      at++;
+      while (at < lines.length) {
+        const item = lines[at];
+        if (item.startsWith('diff --git ') || item.startsWith('@@')
+          || (item.startsWith('--- ') && lines[at + 1]?.startsWith('+++ '))) break;
+        if (item !== '' && ![' ', '-', '+', '\\'].includes(item[0])) break;
+        raw.push(item);
+        at++;
+      }
+      while (raw[raw.length - 1] === '') raw.pop();
+      for (const item of raw) {
+        if (item.startsWith('\\')) {
+          if (body.length) body[body.length - 1].noBreak = true;
         } else {
-          const kind: BodyLine['kind'] = text === '' ? ' ' : text[0] as BodyLine['kind'];
-          previous = { kind, text: text === '' ? '' : text.slice(1) };
-          body.push(previous);
+          body.push({ kind: item === '' ? ' ' : item[0] as BodyLine['kind'], text: item.slice(1) });
         }
       }
-      section.hunks.push({ oldStart, body });
-      continue;
+      section.chunks.push({ line: Number(header[1]), body });
+    } else {
+      if (section && section.chunks.length === 0) {
+        if (!section.paired && line.startsWith('rename from ')) section.old = line.slice(12);
+        else if (!section.paired && line.startsWith('rename to ')) section.next = line.slice(10);
+        else if (line.startsWith('new file mode')) section.create = true;
+        else if (line.startsWith('deleted file mode')) section.remove = true;
+      }
+      at++;
     }
-
-    if (section !== undefined && section.header) {
-      if (line.startsWith('--- ')) throw new Exit2(`error: parse ${i + 2}`);
-      if (line.startsWith('rename from ')) section.renameOld = line.slice('rename from '.length);
-      else if (line.startsWith('rename to ')) section.renameNew = line.slice('rename to '.length);
-      else if (line === 'new file mode' || line.startsWith('new file mode ') || line.startsWith('new file mode\t')) section.create = true;
-      else if (line === 'deleted file mode' || line.startsWith('deleted file mode ') || line.startsWith('deleted file mode\t')) section.remove = true;
-    }
-    i++;
   }
-
-  return sections.map((item): Edit => {
-    const oldPath = item.hasPair ? (item.pairOld ?? null) : (item.renameOld ?? item.gitOld ?? '');
-    const newPath = item.hasPair ? (item.pairNew ?? null) : (item.renameNew ?? item.gitNew ?? '');
-    const creating = oldPath === null || item.create;
-    const deleting = !creating && (newPath === null || item.remove);
-
-    return (tree: Tree): void => {
-      if (oldPath !== null && !safe(oldPath)) throw new Fail('unsafe', oldPath);
-      if (newPath !== null && !safe(newPath)) throw new Fail('unsafe', newPath);
-
-      if (creating) {
-        if (newPath === null) throw new Fail('unsafe', '/dev/null');
-        if (tree.get(newPath) !== null) throw new Fail('exists', newPath);
-        const added: string[] = [];
-        let lastAdded: BodyLine | undefined;
-        for (const hunk of item.hunks) {
-          for (const bodyLine of hunk.body) {
-            if (bodyLine.kind === '+') {
-              added.push(bodyLine.text);
-              lastAdded = bodyLine;
-            }
-          }
-        }
-        tree.now.set(newPath, createdLines(added, !lastAdded?.noNewline));
-        return;
-      }
-
-      if (oldPath === null) throw new Fail('unsafe', '/dev/null');
-      const original = tree.get(oldPath);
-      if (original === null) throw new Fail('missing', oldPath);
-      if (deleting) {
-        tree.now.set(oldPath, null);
-        return;
-      }
-
-      if (newPath === null) throw new Fail('unsafe', '/dev/null');
-      const moving = oldPath !== newPath;
-      if (moving && tree.get(newPath) !== null) throw new Fail('exists', newPath);
-
-      const result = applyHunks(original, item.hunks, strict, oldPath);
-      if (moving) {
-        tree.now.set(oldPath, null);
-        tree.now.set(newPath, result);
-        tree.moves.push({ oldPath, newPath });
-      } else {
-        tree.now.set(oldPath, result);
-      }
-    };
-  });
+  finish();
+  return edits;
 }

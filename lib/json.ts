@@ -1,87 +1,44 @@
-import { Exit2, Fail, blank, safe, patchLines, readLines, writeLines } from './patch.ts';
-import type { Edit, Tree } from './patch.ts';
+import type { Edit } from './patch.ts';
 
-/** One JSON edit object (SPEC.md section 9), or null when it is not one. */
-function jsonEdit(v: unknown): Edit | null {
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
-  const o = v as Record<string, unknown>;
-  const p = o.path;
-  if (typeof p !== 'string') return null;
-  const exists = (tree: Tree): string => {
-    if (!safe(p)) throw new Fail('unsafe', p);
-    const t = tree.get(p);
-    if (t === null) throw new Fail('missing', p);
-    return t;
-  };
-  if (o.command === 'create' && typeof o.file_text === 'string') {
-    const text = o.file_text;
-    return (tree) => {
-      if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
-      tree.now.set(p, text);
-    };
+function decodeEdit(value: unknown, line: number): Edit {
+  const invalid = () => new Error(`parse ${line}`);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid();
+  const object = value as Record<string, unknown>;
+  if (typeof object.path !== 'string') throw invalid();
+  const path = object.path;
+  if (object.command === 'create' && typeof object.file_text === 'string') {
+    return { kind: 'create', path, text: object.file_text };
   }
-  if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
-    const oldStr = o.old_str;
-    const newStr = (o.new_str as string | undefined) ?? '';
-    return (tree) => {
-      const before = exists(tree);
-      const nl = before.indexOf('\n');
-      const crlf = nl > 0 && before[nl - 1] === '\r';
-      const lf = (s: string): string => (crlf ? s.replaceAll('\r\n', '\n') : s);
-      const t = lf(before);
-      const old = lf(oldStr);
-      let count = 0;
-      for (let k = t.indexOf(old); k >= 0; k = t.indexOf(old, k + 1)) count += 1;
-      if (count === 0) throw new Fail('no-match', p);
-      if (count > 1) throw new Fail('ambiguous', p);
-      const at = t.indexOf(old);
-      const out = t.slice(0, at) + lf(newStr) + t.slice(at + old.length);
-      tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
-    };
+  if (object.command === 'str_replace' && typeof object.old_str === 'string' && object.old_str !== ''
+    && (object.new_str === undefined || typeof object.new_str === 'string')) {
+    return { kind: 'replace', path, old: object.old_str, text: object.new_str as string | undefined ?? '' };
   }
-  if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
-    const line = o.insert_line;
-    const add = patchLines(o.new_str);
-    return (tree) => {
-      const file = readLines(exists(tree));
-      if (line < 0 || line > file.lines.length) throw new Fail('no-match', p);
-      file.lines.splice(line, 0, ...add);
-      tree.now.set(p, writeLines(file));
-    };
+  if (object.command === 'insert' && Number.isInteger(object.insert_line) && typeof object.new_str === 'string') {
+    return { kind: 'insert', path, insertLine: object.insert_line as number, text: object.new_str };
   }
-  return null;
+  throw invalid();
 }
 
-export function jsonEdits(text: string, lines: string[]): Edit[] {
-  const first = lines.findIndex((l) => !blank(l));
-  if (first < 0) throw new Exit2('error: parse 1');
-  const edits: Edit[] = [];
-  if (lines[first]!.trimStart().startsWith('[')) {
-    let v: unknown;
+export function parseJson(lines: string[]): Edit[] {
+  const first = lines.findIndex((line) => line.trim() !== '');
+  if (first === -1) return [];
+  if (lines[first].trimStart().startsWith('[')) {
     try {
-      v = JSON.parse(text);
+      const array: unknown = JSON.parse(lines.join('\n'));
+      if (!Array.isArray(array)) throw new Error();
+      return array.map((value) => decodeEdit(value, first + 1));
     } catch {
-      throw new Exit2(`error: parse ${first + 1}`);
+      throw new Error(`parse ${first + 1}`);
     }
-    if (!Array.isArray(v)) throw new Exit2(`error: parse ${first + 1}`);
-    for (const x of v) {
-      const e = jsonEdit(x);
-      if (e === null) throw new Exit2(`error: parse ${first + 1}`);
-      edits.push(e);
-    }
-    return edits;
   }
-  lines.forEach((l, i) => {
-    if (blank(l)) return;
-    let e: Edit | null = null;
+  const edits: Edit[] = [];
+  for (let at = 0; at < lines.length; at++) {
+    if (lines[at].trim() === '') continue;
     try {
-      e = jsonEdit(JSON.parse(l));
+      edits.push(decodeEdit(JSON.parse(lines[at]), at + 1));
     } catch {
-      e = null;
+      throw new Error(`parse ${at + 1}`);
     }
-    if (e === null) throw new Exit2(`error: parse ${i + 1}`);
-    edits.push(e);
-  });
+  }
   return edits;
 }
