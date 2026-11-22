@@ -133,7 +133,9 @@ function changeText(before: string, edit: Edit, strict: boolean): string {
       at = found.positions[0];
       tier = found.tier;
       if (edit.kind === 'unified') {
-        const target = chunk.line - 1 + delta;
+        // A may be longer than a double can hold, where every distance is Infinity and a plain compare ties.
+        // Clamping it just past either end keeps the same nearest order (positions lie inside the file).
+        const target = Math.min(file.lines.length + 1, Math.max(-1, chunk.line - 1 + delta));
         for (const candidate of found.positions) {
           if (Math.abs(candidate - target) < Math.abs(at - target)) at = candidate;
         }

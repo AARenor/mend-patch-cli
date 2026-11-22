@@ -19,7 +19,11 @@ export function parseSearch(lines: string[]): Edit[] {
     if (path === undefined) throw new Error(`parse ${searchLine + 1}`);
     const old: string[] = [];
     at++;
-    while (at < lines.length && lines[at].trimEnd() !== '=======') old.push(lines[at++]);
+    while (at < lines.length && lines[at].trimEnd() !== '=======') {
+      // A block whose old lines run into REPLACE without a ======= is a fault, not a longer old text.
+      if (lines[at].trimEnd() === '>>>>>>> REPLACE') throw new Error(`parse ${searchLine + 1}`);
+      old.push(lines[at++]);
+    }
     if (at === lines.length) throw new Error(`parse ${searchLine + 1}`);
     const added: string[] = [];
     at++;
