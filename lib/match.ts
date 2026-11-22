@@ -29,7 +29,13 @@ function matchingPositions(source: string[], wanted: string[], start: number, en
   return positions;
 }
 
+/**
+ * Reports tier 0 (exact), 1 (trailing whitespace), or 2 (leading and trailing whitespace).
+ * Tier 2 also re-indents additions through replacementLines, so readers must not.
+ */
 export function matchLines(file: string[], old: string[], strict: boolean, start = 0, endOnly = false): LineMatch | null {
+  // An empty old-lines array has no match, including in an empty file.
+  if (old.length === 0) return null;
   // No tier can fit the old lines beyond the remaining search window.
   if (old.length > file.length || start > file.length - old.length) return null;
   // Keep tier priority here so every format chooses exact matches before relaxed ones.
@@ -49,9 +55,13 @@ function indentation(line: string): string {
 }
 
 export function replacementLines(body: BodyLine[], file: string[], at: number, tier: number): string[] {
-  const oldFirst = body.find((line) => line.kind !== '+');
-  const patchIndent = indentation(oldFirst?.text ?? '');
-  const fileIndent = indentation(file[at] ?? '');
+  let patchIndent = '';
+  let fileIndent = '';
+  if (tier === 2) {
+    const oldFirst = body.find((line) => line.kind !== '+');
+    patchIndent = indentation(oldFirst?.text ?? '');
+    fileIndent = indentation(file[at] ?? '');
+  }
   const result: string[] = [];
   let cursor = at;
   for (const line of body) {
