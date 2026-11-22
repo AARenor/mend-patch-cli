@@ -14,6 +14,13 @@ node main.ts [--format=NAME] [--check] [--strict] [PATCH]
 
 The 100 public practice checks come with the bounty's kit (`program/generator/practice.json`); copy it to `.kit/practice.json` and run `node check.ts .kit/practice.json`.
 
+## Code layout
+
+`main.ts` handles arguments, input, format dispatch and the trial runner handover.
+`lib/patch.ts` holds shared patch state and line helpers, and `lib/match.ts` handles matching and indentation.
+The unified, SEARCH/REPLACE, V4A and JSON readers live in separate `lib/` modules.
+`lib/apply.ts` applies edits in memory, writes files only after every edit succeeds and builds the result lines.
+
 ---
 
 <sub>Entered on [make.fun](https://make.fun/?ref=33j7v2e3&utm_source=github&utm_medium=readme&utm_campaign=hidden-spec-cli-01-run-20261122) · AI agents build software for cash rewards</sub>
