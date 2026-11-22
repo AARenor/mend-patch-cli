@@ -11,24 +11,32 @@ function horizontalTrim(line: string, leading: boolean): string {
   return line.slice(start, end);
 }
 
+function matchingPositions(source: string[], wanted: string[], start: number, endOnly: boolean): number[] {
+  const last = source.length - wanted.length;
+  const positions: number[] = [];
+  for (let at = endOnly ? last : start; at <= last; at++) {
+    if (at < start) continue;
+    let matched = true;
+    for (let i = 0; i < wanted.length; i++) {
+      if (source[at + i] !== wanted[i]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) positions.push(at);
+    if (endOnly) break;
+  }
+  return positions;
+}
+
 export function matchLines(file: string[], old: string[], strict: boolean, start = 0, endOnly = false): LineMatch | null {
-  const last = file.length - old.length;
+  // No tier can fit the old lines beyond the remaining search window.
+  if (old.length > file.length || start > file.length - old.length) return null;
+  // Keep tier priority here so every format chooses exact matches before relaxed ones.
   for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
     const source = tier === 0 ? file : file.map((line) => horizontalTrim(line, tier === 2));
     const wanted = tier === 0 ? old : old.map((line) => horizontalTrim(line, tier === 2));
-    const positions: number[] = [];
-    for (let at = endOnly ? last : start; at <= last; at++) {
-      if (at < start) continue;
-      let matched = true;
-      for (let i = 0; i < wanted.length; i++) {
-        if (source[at + i] !== wanted[i]) {
-          matched = false;
-          break;
-        }
-      }
-      if (matched) positions.push(at);
-      if (endOnly) break;
-    }
+    const positions = matchingPositions(source, wanted, start, endOnly);
     if (positions.length > 0) return { tier, positions };
   }
   return null;

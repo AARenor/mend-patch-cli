@@ -17,9 +17,9 @@ The 100 public practice checks come with the bounty's kit (`program/generator/pr
 ## Code layout
 
 `main.ts` handles arguments, input, format dispatch and the trial runner handover.
-`lib/patch.ts` holds shared patch state and line helpers, and `lib/match.ts` handles matching and indentation.
+`lib/patch.ts` holds shared patch state and line helpers, and `lib/match.ts` separates position scanning from shared tier selection and indentation.
 The unified, SEARCH/REPLACE, V4A and JSON readers live in separate `lib/` modules.
-`lib/apply.ts` applies edits in memory, writes files only after every edit succeeds and builds the result lines.
+`lib/apply.ts` applies edits in memory, writes files only after every edit succeeds and builds the result lines. It removes deleted files before writing, so a new directory can replace a deleted file.
 
 ---
 

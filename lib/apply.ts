@@ -35,9 +35,14 @@ export function applyEdits(edits: Edit[], check: boolean): { code: number; out: 
     const was = tree.original(p);
     if (was === now) continue;
     if (!moved.has(p)) changes.push({ path: p, row: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
+  }
+  if (!check) {
+    // Delete blocking files first when a patch creates a path beneath a deleted file.
+    for (const [p, now] of tree.now) {
+      if (now === null && tree.original(p) !== null) rmSync(p, { force: true });
+    }
+    for (const [p, now] of tree.now) {
+      if (now === null || tree.original(p) === now) continue;
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, now);
     }
